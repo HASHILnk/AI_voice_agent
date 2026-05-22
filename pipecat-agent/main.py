@@ -11,7 +11,7 @@ from pipecat.pipeline.task import PipelineTask
 
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.groq.llm import GroqLLMService
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.deepgram.tts import DeepgramTTSService
 
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -26,6 +26,18 @@ from fastapi.responses import JSONResponse
 
 from fastapi import Request
 
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+
+from tools import search_rooms
+
+from database.db import get_connection
+
+from pipecat.processors.aggregators.llm_context import ToolsSchema
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+
+
+
 
 load_dotenv()
 
@@ -39,11 +51,56 @@ async def root():
 app.mount("/ui", SmallWebRTCPrebuiltUI)
 
 
+async def search_rooms_handler(params):
+    print("FUNCTION CALLED")
+
+    city = params.arguments["city"]
+    print("CITY:", city)
+
+    from database.db import get_connection
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT hotel_name, room_type, price, available_rooms
+        FROM hotels
+        WHERE city = %s
+    """
+
+    cursor.execute(query, (city,))
+    rooms = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    if not rooms:
+        await params.result_callback(
+            f"Sorry, I couldn't find any hotels in {city}."
+        )
+        return
+
+    response = f"I found {len(rooms)} hotel options in {city}. "
+
+    for room in rooms:
+        hotel_name, room_type, price, available_rooms = room
+
+        response += (
+            f"{hotel_name} has a {room_type} room "
+            f"for rupees {price}, "
+            f"with {available_rooms} rooms available. "
+        )
+
+    print(response)
+
+    await params.result_callback(response)
 
 async def run_bot(webrtc_connection):
     
+
+
+
     # WebRTC Transport
-    
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -64,25 +121,68 @@ async def run_bot(webrtc_connection):
         api_key=os.getenv("GROQ_API_KEY"),
         settings=GroqLLMService.Settings(
             model="llama-3.3-70b-versatile"
-        )
+        )  
     )
+
+    llm.register_function(
+    "search_rooms",
+    search_rooms_handler
+    )
+
 
     # Text-to-speech
-    tts = ElevenLabsTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        settings=ElevenLabsTTSService.Settings(voice="pNInz6obpgDQGcFmaJgB")
+    tts = DeepgramTTSService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        voice="aura-2-thalia-en"
     )
     
-
+# female-EXAVITQu4vr4xnSDxMaL
 
     messages = [
         {
             "role": "system",
-            "content": "You are a friendly AI voice assistant. Reply briefly."
+            "content": """
+            You are a hotel booking voice assistant.
+
+            You have access to a function:
+
+            search_rooms(city)
+
+            IMPORTANT:
+            If the user asks for hotels,
+            hotel availability,
+            or rooms in a city,
+            ALWAYS call search_rooms.
+
+            Do NOT say:
+            search_rooms(city="Kochi")
+
+            Actually use the function.
+
+            Reply briefly.
+            """
         }
     ]
 
     context = LLMContext(messages)
+    tools = ToolsSchema(
+        standard_tools=[
+            FunctionSchema(
+                name="search_rooms",
+                description="Search available hotel rooms in a city",
+                properties={
+                    "city": {
+                        "type": "string",
+                        "description": "Name of the city"
+                    }
+                },
+                required=["city"]
+            )
+        ]
+    )
+
+    context.set_tools(tools)
+    context.set_tool_choice("auto")
     context_aggregator = LLMContextAggregatorPair(context)
 
 
