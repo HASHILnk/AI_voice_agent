@@ -6,6 +6,9 @@ from fastapi import FastAPI
 import uvicorn
 
 from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.serializers.exotel import ExotelFrameSerializer
+from pipecat.frames.frames import AudioRawFrame, EndTaskFrame
+from pipecat.processors.frame_processor import FrameDirection
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -13,6 +16,7 @@ from pipecat.pipeline.task import PipelineTask
 
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.groq.llm import GroqLLMService
+from groq import AsyncGroq
 from pipecat.services.deepgram.tts import DeepgramTTSService
 
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -20,7 +24,12 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.base_transport import TransportParams
 
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams
+)
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
 
@@ -42,12 +51,16 @@ from fastapi.responses import Response
 
 from fastapi import WebSocket
 
-from twilio.twiml.voice_response import VoiceResponse, Connect
+
+from twilio.rest import Client
 
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
     FastAPIWebsocketParams
 )
+
+import requests
+from requests.auth import HTTPBasicAuth
 
 
 
@@ -55,11 +68,44 @@ load_dotenv()
 
 app = FastAPI()
 
+conversation_history = {}
+
+def save_message(call_sid, role, text):
+    if call_sid not in conversation_history:
+        conversation_history[call_sid] = []
+
+    conversation_history[call_sid].append(
+        {
+            "role": role,
+            "content": text
+        }
+    )
+
 @app.get("/")
 async def root():
     return {"message": "Docker auto reload working"}
 
 
+
+
+@app.get("/make-call")
+async def make_call():
+
+    client = Client(
+        os.getenv("TWILIO_ACCOUNT_SID"),
+        os.getenv("TWILIO_AUTH_TOKEN")
+    )
+
+    call = client.calls.create(
+        to=os.getenv("MY_PHONE_NUMBER"),
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),
+        url="https://liftable-actionable-joeann.ngrok-free.dev/incoming-call"
+    )
+
+    return {
+        "message": "Call started",
+        "call_sid": call.sid
+    }
 
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
@@ -121,6 +167,8 @@ async def twilio_media(websocket: WebSocket):
     print("STREAM SID:", stream_sid)
     print("CALL SID:", call_sid)
 
+    conversation_history[call_sid] = []
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -137,7 +185,16 @@ async def twilio_media(websocket: WebSocket):
 
     print("TWILIO BOT STARTED")
 
-    await run_twilio_bot(transport)
+    await run_twilio_bot(transport, call_sid)
+
+
+
+
+
+
+
+
+
 
 # Mount Pipecat prebuilt UI
 app.mount("/ui", SmallWebRTCPrebuiltUI)
@@ -312,9 +369,163 @@ async def get_bookings_handler(params):
     await params.result_callback(response)
 
 
-async def run_twilio_bot(transport):
+async def transfer_call_handler(params):
+
+    print("TRANSFER CALL FUNCTION CALLED")
+
+    call_sid = params.arguments["call_sid"]
+
+    support_number = os.getenv(
+        "SUPPORT_AGENT_NUMBER"
+    )
+
+    client = Client(
+        os.getenv("TWILIO_ACCOUNT_SID"),
+        os.getenv("TWILIO_AUTH_TOKEN")
+    )
+
+    transfer_twiml = f"""
+    <Response>
+        <Dial>{support_number}</Dial>
+    </Response>
+    """
+
+    client.calls(call_sid).update(
+        twiml=transfer_twiml
+    )
+
+    await params.result_callback(
+        "Okay, transferring your call to a human support agent now."
+    )
+
+
+async def warm_transfer_handler(params):
+
+    print("WARM TRANSFER STARTED")
+
+    call_sid = params.arguments["call_sid"]
+
+    client = Client(
+        os.getenv("TWILIO_ACCOUNT_SID"),
+        os.getenv("TWILIO_AUTH_TOKEN")
+    )
+
+    conference_name = f"support-{call_sid}"
+
+    # Get conversation history
+    history = conversation_history.get(
+        call_sid,
+        []
+    )
+
+    history_text = "\n".join([
+        f"{msg['role']}: {msg['content']}"
+        for msg in history[-10:]
+    ])
+
+    # Ask LLM to summarize
+    groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+    summary_response = await groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": """
+                Summarize the customer's issue
+                in one short sentence for a
+                human support agent.
+                """
+            },
+            {
+                "role": "user",
+                "content": history_text
+            }
+        ]
+    )
+
+    summary = (
+        summary_response
+        .choices[0]
+        .message.content
+    )
+
+    print("SUMMARY:", summary)
+
+    # Call support first
+    client.calls.create(
+        to=os.getenv("SUPPORT_AGENT_NUMBER"),
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),
+        twiml=f"""
+        <Response>
+            <Say>
+                Customer summary:
+                {summary}
+            </Say>
+
+            <Dial>
+                <Conference
+                    startConferenceOnEnter="true"
+                    endConferenceOnExit="false">
+                    {conference_name}
+                </Conference>
+            </Dial>
+        </Response>
+        """
+    )
+
+    # Move customer into conference
+    client.calls(call_sid).update(
+        twiml=f"""
+        <Response>
+            <Say>
+                Connecting you to support.
+            </Say>
+
+            <Dial>
+                <Conference
+                    startConferenceOnEnter="true"
+                    endConferenceOnExit="true">
+                    {conference_name}
+                </Conference>
+            </Dial>
+        </Response>
+        """
+    )
+
+    await params.result_callback(
+        "Connecting you to support now."
+    )
+
+    
+
+
+async def hangup_call_handler(params):
+    print("HANGUP CALL FUNCTION CALLED")
+    call_sid = params.arguments["call_sid"]
+    await params.result_callback("Goodbye! Thank you for calling.")
+    await asyncio.sleep(4)
+    client = Client(
+        os.getenv("TWILIO_ACCOUNT_SID"),
+        os.getenv("TWILIO_AUTH_TOKEN")
+    )
+    try:
+        client.calls(call_sid).update(status="completed")
+    except Exception as e:
+        print("Error hanging up call:", e)
+
+
+async def run_twilio_bot(transport, call_sid):
 
     print("TWILIO BOT STARTED")
+
+    # Voice Activity Detection
+    vad_analyzer = SileroVADAnalyzer(
+        params=VADParams(
+            confidence=0.7,
+            start_secs=0.2,
+            stop_secs=0.7
+        )
+    )
 
     # Speech-to-text
     stt = DeepgramSTTService(
@@ -329,7 +540,10 @@ async def run_twilio_bot(transport):
         )
     )
 
+
+
     # Register tools
+
     llm.register_function(
         "search_rooms",
         search_rooms_handler
@@ -345,6 +559,22 @@ async def run_twilio_bot(transport):
         get_bookings_handler
     )
 
+    llm.register_function(
+    "transfer_call",
+    transfer_call_handler
+    )
+
+    llm.register_function(
+    "warm_transfer",
+    warm_transfer_handler
+    )
+
+    llm.register_function(
+        "hangup_call",
+        hangup_call_handler
+    )
+
+
     # Text-to-speech
     tts = DeepgramTTSService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
@@ -354,22 +584,32 @@ async def run_twilio_bot(transport):
     messages = [
         {
             "role": "system",
-            "content": """
-            You are a hotel booking phone assistant.
+            "content": f"""
+                You are a helpful and professional hotel booking phone assistant.
+                Speak naturally and politely like a real receptionist.
 
-            Speak naturally like a real receptionist.
+                Your goal is to help users:
+                1. Search for available hotel rooms in a city (using the 'search_rooms' tool).
+                2. Book a hotel room (using the 'book_room' tool).
+                3. Retrieve their booking records (using the 'get_bookings' tool).
 
-            Available tools:
-            - search_rooms
-            - book_room
-            - get_bookings
+                Rules:
+                - Keep your responses short, concise, and friendly.
+                - Never automatically book a room without user confirmation.
+                - If details for booking (customer name, check-in date, or number of nights) are missing, ask for them one by one.
+                - Speak naturally for a voice-based telephone call.
+                - If the user asks to talk to a human, support person, real person, manager, or says they are unhappy, immediately use the 'warm_transfer' function.
+                - Do not ask unnecessary questions before transfer.
+                - Politely confirm transfer.
+                - If the user says goodbye, bye, or wants to end the call, immediately call the 'hangup_call' tool to disconnect the line.
 
-            Rules:
-            - Never book automatically.
-            - Ask for missing details.
-            - Reply briefly.
-            - Speak naturally for phone calls.
-            """
+                The current call_sid is:
+                {call_sid}
+
+                IMPORTANT:
+                Whenever calling 'warm_transfer' or 'hangup_call',
+                always include this exact call_sid.
+                """
         }
     ]
 
@@ -432,6 +672,40 @@ async def run_twilio_bot(transport):
                     }
                 },
                 required=["customer_name"]
+            ),
+
+            FunctionSchema(
+                name="transfer_call",
+                description="Transfer the current call to a human support agent",
+                properties={
+                    "call_sid": {
+                        "type": "string",
+                        "description": "Current call SID"
+                    }
+                },
+                required=["call_sid"]
+            ),
+
+            FunctionSchema(
+                name="warm_transfer",
+                description="Transfer customer to support agent using conference call",
+                properties={
+                    "call_sid": {
+                        "type": "string"
+                    }
+                },
+                required=["call_sid"]
+            ),
+
+            FunctionSchema(
+                name="hangup_call",
+                description="End the call when the conversation is finished or user says goodbye",
+                properties={
+                    "call_sid": {
+                        "type": "string"
+                    }
+                },
+                required=["call_sid"]
             )
         ]
     )
@@ -439,7 +713,30 @@ async def run_twilio_bot(transport):
     context.set_tools(tools)
     context.set_tool_choice("auto")
 
-    context_aggregator = LLMContextAggregatorPair(context)
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=vad_analyzer
+        )
+    )
+
+    @context_aggregator.user().event_handler("on_user_turn_stopped")
+    async def on_user_context(aggregator, strategy, message):
+        save_message(
+            call_sid,
+            "user",
+            message.content
+        )
+
+
+    @context_aggregator.assistant().event_handler("on_assistant_turn_stopped")
+    async def on_assistant_context(aggregator, message):
+        save_message(
+            call_sid,
+            "assistant",
+            message.content
+        )
+
 
     pipeline = Pipeline([
         transport.input(),
@@ -458,9 +755,39 @@ async def run_twilio_bot(transport):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async def run_bot(webrtc_connection):
     
-    
+    # Voice Activity Detection
+    vad_analyzer = SileroVADAnalyzer(
+        params=VADParams(
+            confidence=0.7,
+            start_secs=0.2,
+            stop_secs=0.5
+        )
+    )
     
 
     # WebRTC Transport
@@ -540,6 +867,7 @@ async def run_bot(webrtc_connection):
                 - nights
             - Ask follow-up questions one by one.
             - Reply briefly and naturally.
+            - If the user says goodbye, bye, or wants to end the call, politely say goodbye and do not call any tools.
 
             Examples:
 
@@ -634,7 +962,12 @@ async def run_bot(webrtc_connection):
 
     context.set_tools(tools)
     context.set_tool_choice("auto")
-    context_aggregator = LLMContextAggregatorPair(context)
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=vad_analyzer
+        )
+    )
 
 
     pipeline = Pipeline([
@@ -683,3 +1016,54 @@ async def connect(request: Request):
 
     
 
+
+
+
+
+
+# @app.websocket("/exotel-media")
+# async def exotel_media(websocket: WebSocket):
+
+#     await websocket.accept()
+
+#     print("EXOTEL CONNECTED!")
+
+#     global current_call_sid 
+#     stream_sid = None
+#     call_sid = None
+#     account_sid = None
+
+#     while True:
+#         message = await websocket.receive_json()
+
+#         # print("EXOTEL EVENT:", message)
+
+#         if message.get("event") == "start":
+#             start_data = message.get("start", {})
+
+#             stream_sid = start_data.get("streamSid") or start_data.get("stream_sid") or "TEST_STREAM"
+#             call_sid = start_data.get("callSid") or start_data.get("call_sid") or "TEST_CALL"
+#             current_call_sid = call_sid
+#             print("CURRENT CALL SID:", current_call_sid)
+#             account_sid = start_data.get("accountSid") or start_data.get("account_sid") or "TEST_ACCOUNT"
+#             break
+
+#     # print("STREAM SID:", stream_sid)
+#     # print("CALL SID:", call_sid)
+
+#     transport = FastAPIWebsocketTransport(
+#         websocket=websocket,
+#         params=FastAPIWebsocketParams(
+#             audio_in_enabled=True,
+#             audio_out_enabled=True,
+#             fixed_audio_packet_size=1600,
+#             serializer=ExotelFrameSerializer(
+#                 stream_sid=stream_sid,
+#                 call_sid=call_sid
+#             )
+#         )
+#     )
+
+#     print("EXOTEL BOT STARTED")
+
+#     await run_exotel_bot(transport)
