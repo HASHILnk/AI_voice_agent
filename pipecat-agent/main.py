@@ -62,6 +62,12 @@ from pipecat.transports.websocket.fastapi import (
 import requests
 from requests.auth import HTTPBasicAuth
 
+from pipecat.audio.filters.aic_filter import AICFilter
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams
+)
+
 
 
 load_dotenv()
@@ -169,11 +175,18 @@ async def twilio_media(websocket: WebSocket):
 
     conversation_history[call_sid] = []
 
+    aic_filter = AICFilter(
+        license_key=os.getenv("AIC_SDK_LICENSE"),
+        model_id="quail-vf-2.1-l-16khz",
+        enhancement_level=0.80
+    )
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            audio_in_filter=aic_filter,
             serializer=TwilioFrameSerializer(
                 stream_sid=stream_sid,
                 call_sid=call_sid,
@@ -185,7 +198,7 @@ async def twilio_media(websocket: WebSocket):
 
     print("TWILIO BOT STARTED")
 
-    await run_twilio_bot(transport, call_sid)
+    await run_twilio_bot(transport, call_sid, aic_filter)
 
 
 
@@ -514,18 +527,9 @@ async def hangup_call_handler(params):
         print("Error hanging up call:", e)
 
 
-async def run_twilio_bot(transport, call_sid):
+async def run_twilio_bot(transport, call_sid, aic_filter):
 
     print("TWILIO BOT STARTED")
-
-    # Voice Activity Detection
-    vad_analyzer = SileroVADAnalyzer(
-        params=VADParams(
-            confidence=0.7,
-            start_secs=0.2,
-            stop_secs=0.7
-        )
-    )
 
     # Speech-to-text
     stt = DeepgramSTTService(
@@ -716,7 +720,10 @@ async def run_twilio_bot(transport, call_sid):
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=vad_analyzer
+            vad_analyzer=aic_filter.create_vad_analyzer(
+                speech_hold_duration=0.05,
+                sensitivity=6.0
+            )
         )
     )
 
@@ -780,22 +787,18 @@ async def run_twilio_bot(transport, call_sid):
 
 async def run_bot(webrtc_connection):
     
-    # Voice Activity Detection
-    vad_analyzer = SileroVADAnalyzer(
-        params=VADParams(
-            confidence=0.7,
-            start_secs=0.2,
-            stop_secs=0.5
-        )
+    aic_filter = AICFilter(
+        license_key=os.getenv("AIC_SDK_LICENSE"),
+        model_id="quail-vf-2.1-l-16khz"
     )
     
-
     # WebRTC Transport
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            audio_in_filter=aic_filter
         )
     )
 
@@ -965,7 +968,10 @@ async def run_bot(webrtc_connection):
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=vad_analyzer
+            vad_analyzer=aic_filter.create_vad_analyzer(
+                speech_hold_duration=0.05,
+                sensitivity=6.0
+            )
         )
     )
 
