@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS hotels (
 CREATE TABLE IF NOT EXISTS bookings (
     id SERIAL PRIMARY KEY,
     customer_name VARCHAR(255) NOT NULL,
+    customer_phone VARCHAR(50),
     hotel_name VARCHAR(255) NOT NULL,
     city VARCHAR(100) NOT NULL,
     room_type VARCHAR(100) NOT NULL,

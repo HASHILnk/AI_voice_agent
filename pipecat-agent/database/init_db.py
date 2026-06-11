@@ -1,21 +1,38 @@
-from db import get_connection
-
+from database.db import get_connection
+import psycopg2
 
 def initialize_database():
-    conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
 
-    with open("database/schema.sql", "r") as file:
-        sql_script = file.read()
+        # Check if hotels table exists and has data to avoid duplicate inserts
+        cursor.execute("SELECT to_regclass('public.hotels');")
+        table_exists = cursor.fetchone()[0]
+        
+        has_data = False
+        if table_exists:
+            cursor.execute("SELECT COUNT(*) FROM hotels;")
+            has_data = cursor.fetchone()[0] > 0
 
-    cursor.execute(sql_script)
+        if not has_data:
+            with open("database/schema.sql", "r") as file:
+                sql_script = file.read()
 
-    conn.commit()
+            cursor.execute(sql_script)
+            conn.commit()
+            print("Database initialized successfully!")
+        else:
+            print("Database already initialized with data.")
 
-    cursor.close()
-    conn.close()
+        # Ensure customer_phone column exists (migration for existing database)
+        cursor.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(50);")
+        conn.commit()
 
-    print("Database initialized successfully!")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print("Database initialization error:", e)
 
-
-initialize_database()
+if __name__ == "__main__":
+    initialize_database()

@@ -1,6 +1,7 @@
 import os
 import asyncio
 from dotenv import load_dotenv
+import uuid
 
 from fastapi import FastAPI
 import uvicorn
@@ -18,6 +19,8 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.groq.llm import GroqLLMService
 from groq import AsyncGroq
 from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.sarvam.stt import SarvamSTTService
+from pipecat.services.sarvam.tts import SarvamTTSService
 
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -28,7 +31,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams
 )
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
@@ -43,6 +45,7 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from tools import search_rooms, get_bookings
 
 from database.db import get_connection
+from database.init_db import initialize_database
 
 from pipecat.processors.aggregators.llm_context import ToolsSchema
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -68,11 +71,18 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams
 )
 
+from rag.rag_search import (
+    search_hotel_policy
+)
 
 
 load_dotenv()
 
 app = FastAPI()
+
+@app.on_event("startup")
+def startup_event():
+    initialize_database()
 
 conversation_history = {}
 
@@ -218,56 +228,52 @@ app.mount("/ui", SmallWebRTCPrebuiltUI)
 async def search_rooms_handler(params):
     print("FUNCTION CALLED")
 
-    city = params.arguments["city"].strip().title()
-    valid_cities = [
-        "Kochi",
-        "Bangalore",
-        "Munnar"
-    ]
+    try:
+        city = params.arguments["city"].strip().title()
 
-    if city not in valid_cities:
-        await params.result_callback(
-            f"Sorry, I couldn't find hotels in {city}. "
-            f"Available cities are Kochi, Bangalore, and Munnar."
-        )
-        return
-    print("CITY:", city)
+        valid_cities = [
+            "Kochi",
+            "Bangalore",
+            "Munnar"
+        ]
 
-    conn = get_connection()
-    cursor = conn.cursor()
+        if city not in valid_cities:
+            await params.result_callback(
+                f"Sorry, we currently support hotels only in Kochi, Bangalore, and Munnar."
+            )
+            return
 
-    query = """
-        SELECT hotel_name, room_type, price, available_rooms
-        FROM hotels
-        WHERE city = %s
-    """
+        hotels = search_rooms(city)
 
-    cursor.execute(query, (city,))
-    rooms = cursor.fetchall()
+        if not hotels:
+            await params.result_callback(
+                f"Sorry, I couldn't find hotels in {city} right now."
+            )
+            return
 
-    cursor.close()
-    conn.close()
+        response = f"I found some hotel options in {city}. "
 
-    if not rooms:
-        await params.result_callback(
-            f"Sorry, I couldn't find any hotels in {city}."
-        )
-        return
-
-    response = f"I found {len(rooms)} hotel options in {city}. "
-
-    for room in rooms:
-        hotel_name, room_type, price, available_rooms = room
+        for hotel in hotels:
+            if hotel["available_rooms"] > 0:
+                response += (
+                    f"{hotel['hotel_name']} has a "
+                    f"{hotel['room_type']} room for "
+                    f"{hotel['price']} rupees, "
+                    f"with {hotel['available_rooms']} rooms available. "
+                )
 
         response += (
-            f"{hotel_name} has a {room_type} room "
-            f"for rupees {price}, "
-            f"with {available_rooms} rooms available. "
+            "Which hotel would you like?"
         )
 
-    print(response)
+        await params.result_callback(response)
 
-    await params.result_callback(response)
+    except Exception as e:
+        print("SEARCH ERROR:", e)
+
+        await params.result_callback(
+            "Sorry, our hotel booking system is temporarily unavailable."
+        )
 
 
 
@@ -277,11 +283,63 @@ async def book_room_handler(params):
 
     hotel_name = params.arguments["hotel_name"]
     customer_name = params.arguments["customer_name"]
+    customer_phone = params.arguments.get("customer_phone")
     check_in_date = params.arguments["check_in_date"]
     nights = params.arguments["nights"]
+    city = params.arguments.get("city")
+    if city:
+        city = city.strip().title()
+    room_type = params.arguments.get("room_type")
+    if room_type:
+        room_type_lower = room_type.lower()
+        if "standard" in room_type_lower:
+            room_type = "Standard"
+        elif "deluxe" in room_type_lower:
+            room_type = "Deluxe"
+        elif "premium" in room_type_lower:
+            room_type = "Premium"
+        else:
+            room_type = room_type.strip().title()
+
+    # Format customer_phone to E.164
+    if customer_phone:
+        digits = "".join(c for c in str(customer_phone) if c.isdigit())
+        if len(digits) == 10:
+            customer_phone = f"+91{digits}"
+        elif len(digits) == 12 and digits.startswith("91"):
+            customer_phone = f"+{digits}"
+        elif not str(customer_phone).startswith("+"):
+            customer_phone = f"+{digits}"
 
     conn = get_connection()
     cursor = conn.cursor()
+
+    # Fallback lookups for missing arguments (city, room_type)
+    if not city and hotel_name:
+        try:
+            cursor.execute(
+                "SELECT DISTINCT city FROM hotels WHERE LOWER(hotel_name) = LOWER(%s) LIMIT 1;",
+                (hotel_name,)
+            )
+            row = cursor.fetchone()
+            if row:
+                city = row[0]
+                print(f"Looked up missing city: {city}")
+        except Exception as e:
+            print("Error looking up missing city:", e)
+
+    if not room_type and hotel_name:
+        try:
+            cursor.execute(
+                "SELECT DISTINCT room_type FROM hotels WHERE LOWER(hotel_name) = LOWER(%s) AND available_rooms > 0 LIMIT 1;",
+                (hotel_name,)
+            )
+            row = cursor.fetchone()
+            if row:
+                room_type = row[0]
+                print(f"Looked up missing room_type: {room_type}")
+        except Exception as e:
+            print("Error looking up missing room_type:", e)
 
     # Check hotel availability
     cursor.execute(
@@ -289,10 +347,12 @@ async def book_room_handler(params):
         SELECT hotel_name, city, room_type
         FROM hotels
         WHERE hotel_name = %s
+        AND city = %s
+        AND room_type = %s
         AND available_rooms > 0
         LIMIT 1
         """,
-        (hotel_name,)
+        (hotel_name, city, room_type)
     )
 
     hotel = cursor.fetchone()
@@ -302,7 +362,7 @@ async def book_room_handler(params):
         conn.close()
 
         await params.result_callback(
-            f"Sorry, no rooms are available at {hotel_name}."
+            f"Sorry, no {room_type} rooms are currently available at {hotel_name}."
         )
         return
 
@@ -314,16 +374,18 @@ async def book_room_handler(params):
         INSERT INTO bookings
         (
             customer_name,
+            customer_phone,
             hotel_name,
             city,
             room_type,
             check_in_date,
             nights
         )
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """,
         (
             customer_name,
+            customer_phone,
             hotel_name,
             city,
             room_type,
@@ -338,14 +400,41 @@ async def book_room_handler(params):
         UPDATE hotels
         SET available_rooms = available_rooms - 1
         WHERE hotel_name = %s
+        AND city = %s
+        AND room_type = %s
         """,
-        (hotel_name,)
+        (hotel_name, city, room_type)
     )
 
     conn.commit()
 
     cursor.close()
     conn.close()
+
+    # Send confirmation SMS if customer_phone is provided
+    if customer_phone:
+        try:
+            from twilio.rest import Client
+            twilio_client = Client(
+                os.getenv("TWILIO_ACCOUNT_SID"),
+                os.getenv("TWILIO_AUTH_TOKEN")
+            )
+            sms_body = f"Booking confirmed! Your {room_type} room at {hotel_name} in {city} has been booked successfully for {nights} nights starting {check_in_date}."
+            
+            # Send SMS
+            try:
+                print(f"Sending confirmation SMS to {customer_phone}...")
+                twilio_client.messages.create(
+                    body=sms_body,
+                    from_=os.getenv("TWILIO_PHONE_NUMBER"),
+                    to=customer_phone
+                )
+                print("SMS sent successfully.")
+            except Exception as e:
+                print("Error sending SMS:", e)
+                
+        except Exception as e:
+            print("Error initializing Twilio client for notifications:", e)
 
     await params.result_callback(
         f"{customer_name}, your {room_type} room at {hotel_name} in {city} has been booked successfully for {nights} nights starting {check_in_date}."
@@ -380,6 +469,23 @@ async def get_bookings_handler(params):
     print(response)
 
     await params.result_callback(response)
+
+
+async def hotel_policy_handler(params):
+
+    print("HOTEL POLICY SEARCH")
+
+    question = params.arguments[
+        "question"
+    ]
+
+    result = search_hotel_policy(
+        question
+    )
+
+    await params.result_callback(
+        result
+    )
 
 
 async def transfer_call_handler(params):
@@ -528,12 +634,15 @@ async def hangup_call_handler(params):
 
 
 async def run_twilio_bot(transport, call_sid, aic_filter):
-
     print("TWILIO BOT STARTED")
 
     # Speech-to-text
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY")
+    stt = SarvamSTTService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        settings=SarvamSTTService.Settings(
+            model="saaras:v3",
+            language="unknown"
+        )
     )
 
     # LLM
@@ -564,13 +673,18 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
     )
 
     llm.register_function(
-    "transfer_call",
-    transfer_call_handler
+        "search_hotel_policy",
+        hotel_policy_handler
     )
 
     llm.register_function(
-    "warm_transfer",
-    warm_transfer_handler
+        "transfer_call",
+        transfer_call_handler
+    )
+
+    llm.register_function(
+        "warm_transfer",
+        warm_transfer_handler
     )
 
     llm.register_function(
@@ -580,42 +694,111 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
 
 
     # Text-to-speech
-    tts = DeepgramTTSService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        voice="aura-2-thalia-en"
+    tts = SarvamTTSService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        settings=SarvamTTSService.Settings(
+            model="bulbul:v3-beta",
+            voice="shubh"
+        )
     )
 
     messages = [
         {
             "role": "system",
             "content": f"""
-                You are a helpful and professional hotel booking phone assistant.
-                Speak naturally and politely like a real receptionist.
+            You are a warm, friendly, professional hotel receptionist speaking over a phone call.
 
-                Your goal is to help users:
-                1. Search for available hotel rooms in a city (using the 'search_rooms' tool).
-                2. Book a hotel room (using the 'book_room' tool).
-                3. Retrieve their booking records (using the 'get_bookings' tool).
+            Speak naturally like a real human receptionist, not like an AI assistant.
 
-                Rules:
-                - Keep your responses short, concise, and friendly.
-                - Never automatically book a room without user confirmation.
-                - If details for booking (customer name, check-in date, or number of nights) are missing, ask for them one by one.
-                - Speak naturally for a voice-based telephone call.
-                - If the user asks to talk to a human, support person, real person, manager, or says they are unhappy, immediately use the 'warm_transfer' function.
-                - Do not ask unnecessary questions before transfer.
-                - Politely confirm transfer.
-                - If the user says goodbye, bye, or wants to end the call, immediately call the 'hangup_call' tool to disconnect the line.
+            Your job:
+            - Help customers find hotels
+            - Book hotel rooms
+            - Retrieve booking details
+            - Answer hotel policy questions
+            - Transfer to a human if needed
 
-                The current call_sid is:
-                {call_sid}
+            Conversation Style & Language Examples:
+            - Keep responses short and natural.
+            - Sound warm, polite, and conversational.
+            - Never sound robotic.
+            - Speak in the SAME language as the user.
+            - Support English, Malayalam, Hindi, Tamil, and mixed-language speech.
+            - If the customer mixes languages, respond naturally in the same mixed style.
+            - Never force English.
+            - If the user asks to speak in another language, switch naturally and continue in that language.
 
-                IMPORTANT:
-                Whenever calling 'warm_transfer' or 'hangup_call',
-                always include this exact call_sid.
-                """
+            Mixed-Language Examples:
+            User: "Kochi-yil room undo?"
+            Assistant: "Yes, Kochi-il rooms available undu. What type of room are you looking for?"
+
+            User: "Munnar me hotel available hai?"
+            Assistant: "Yes, Munnar mein hotels available hain. Aapko standard ya deluxe room chahiye?"
+
+            User: "Can you speak Malayalam?"
+            Assistant: "ശരി, മലയാളത്തിൽ സംസാരിക്കാം. എന്ത് സഹായമാണ് വേണ്ടത്?"
+
+            Greetings & Filler Words:
+            - For greetings or filler words like: "hi", "hello", "okay", "yes", "hmm", "alright" or short acknowledgements, respond naturally and briefly.
+            Examples:
+            User: "Hi"
+            Assistant: "Hello! How can I help you?"
+            User: "Okay"
+            Assistant: "Sure 🙂"
+            - Do not treat greetings or filler words as hotel search requests.
+            - Do not say "I didn't catch that" for normal greetings or filler words.
+            - If speech is completely unclear, has low confidence, is ambiguous, or is silent, politely ask: "Sorry, I didn't catch that. Could you repeat please?"
+
+            Language & City Guessing Rules:
+            - Never infer or guess a city from language, accent, random words, or uncertain pronunciation (e.g. if the user speaks Gujarati, do not guess Ahmedabad).
+            - Only search for hotels after the user clearly mentions a city name.
+            - If uncertain or if the city has not been specified, politely ask: "Sorry, which city are you looking for?"
+
+            Hotel Search Flow & Rules:
+            - Step 1: When the user mentions a city (e.g., "Kochi"), respond naturally saying you will search (e.g., "Kochi-yil hotel check cheyyam. Oru nimisham.") and immediately trigger the 'search_rooms' tool with the city name. Do NOT ask for the room type or other details before searching.
+            - Step 2: Once the tool returns the list of hotels, present them to the user (e.g., "Kochi-yil 3 hotels available undu: Grand Palace, Marina Inn, Sea View Hotel. Ithil etha book cheyyendathu?") and ask which hotel they would like to select.
+            - Step 3: Only after the user selects a hotel, ask for the room type.
+            - Never invent hotel names, room types, prices, or availability. Only use information returned from tools.
+            - If the city name sounds unclear or you are uncertain because of pronunciation, confirm: "Did you mean Kochi?" or "Could you repeat the city name please?"
+
+            Booking Rules:
+            - Never book automatically.
+            - First let the customer choose a hotel.
+            - Collect details ONE question at a time in this order:
+              1. Customer name
+              2. Customer phone number (must verify it is exactly a 10-digit number; if they provide an invalid number, ask them to repeat/verify)
+              3. Check-in date
+              4. Number of nights
+            - Never ask multiple questions together.
+            - Never guess missing details.
+            - Before calling 'book_room', confirm details briefly. Example: "Just confirming — Grand Palace in Kochi, for John Doe at 9847573743, check-in on December 5, for 2 nights. Shall I book it?"
+            - Only call 'book_room' after the customer clearly confirms (e.g., "yes", "okay", "correct", "book it").
+
+            Hotel Policies:
+            - If the customer asks about: pets, breakfast, wifi, parking, cancellation, check-in/out, pool, gym, pickup, smoking, room service, late checkout, ID proof, or hotel rules, ALWAYS use the 'search_hotel_policy' tool before answering. Never guess.
+
+            Human Transfer:
+            - Call the 'warm_transfer' tool only if the customer explicitly asks for: human, manager, support, real person, transfer call, OR if the customer is frustrated after repeated failures.
+            - Do not transfer for greetings, silence, or language switching.
+            - Politely confirm transfer and call the tool immediately.
+
+            Call Ending:
+            - If the customer says goodbye, bye, or wants to end the call, immediately call the 'hangup_call' tool to disconnect.
+
+            Tool Calling Formatting Rules:
+            - You must call tools natively using the function calling interface.
+            - Never output raw JSON, XML tags, or code snippets (e.g., `<function=...>`, `</function>`, `{{"city": ...}}`) in your conversational text responses.
+            - Do not describe or output the function call to the user. Execute the tool natively and speak only in normal, friendly language.
+
+            Current call_sid:
+            {call_sid}
+
+            Always include this call_sid when calling:
+            - 'warm_transfer'
+            - 'hangup_call'
+            """
         }
     ]
+
 
     context = LLMContext(messages)
 
@@ -645,6 +828,10 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
                     "customer_name": {
                         "type": "string"
                     },
+                    "customer_phone": {
+                        "type": "string",
+                        "description": "The customer's 10-digit phone number (e.g. 9847573743)"
+                    },
                     "check_in_date": {
                         "type": "string",
                         "description": "Check-in date in YYYY-MM-DD format"
@@ -662,6 +849,7 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
                 required=[
                     "hotel_name",
                     "customer_name",
+                    "customer_phone",
                     "check_in_date",
                     "nights"
                 ]
@@ -676,6 +864,24 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
                     }
                 },
                 required=["customer_name"]
+            ),
+
+            FunctionSchema(
+                name="search_hotel_policy",
+                description="""
+                Search hotel policy, FAQs,
+                amenities, cancellation,
+                pet policy, timings,
+                hotel services and rules.
+                """,
+                properties={
+                    "question": {
+                        "type": "string",
+                        "description":
+                        "Hotel-related question"
+                    }
+                },
+                required=["question"]
             ),
 
             FunctionSchema(
@@ -717,13 +923,21 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
     context.set_tools(tools)
     context.set_tool_choice("auto")
 
+    vad_analyzer = aic_filter.create_vad_analyzer()
+    vad_analyzer._sample_rate = 16000
+    vad_analyzer.set_params(
+        VADParams(
+            confidence=0.5,
+            start_secs=0.0,
+            stop_secs=0.3,
+            min_volume=0.0
+        )
+    )
+
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=aic_filter.create_vad_analyzer(
-                speech_hold_duration=0.05,
-                sensitivity=6.0
-            )
+            vad_analyzer=vad_analyzer
         )
     )
 
@@ -786,10 +1000,13 @@ async def run_twilio_bot(transport, call_sid, aic_filter):
 
 
 async def run_bot(webrtc_connection):
+    call_sid = f"webrtc-{uuid.uuid4().hex[:12]}"
+    conversation_history[call_sid] = []
     
     aic_filter = AICFilter(
         license_key=os.getenv("AIC_SDK_LICENSE"),
-        model_id="quail-vf-2.1-l-16khz"
+        model_id="quail-vf-2.1-l-16khz",
+        enhancement_level=0.80
     )
     
     # WebRTC Transport
@@ -802,11 +1019,35 @@ async def run_bot(webrtc_connection):
         )
     )
 
+    async def webrtc_transfer_call_handler(params):
+        print("WEBRTC TRANSFER CALL FUNCTION CALLED")
+        await params.result_callback(
+            "Okay, transferring your call to a human support agent now. Please hold on."
+        )
+        await task.stop_when_done()
+
+    async def webrtc_warm_transfer_handler(params):
+        print("WEBRTC WARM TRANSFER FUNCTION CALLED")
+        await params.result_callback(
+            "Connecting you to support now. Please hold on."
+        )
+        await task.stop_when_done()
+
+    async def webrtc_hangup_call_handler(params):
+        print("WEBRTC HANGUP CALL FUNCTION CALLED")
+        await params.result_callback(
+            "Goodbye! Thank you for using our web assistant."
+        )
+        await task.stop_when_done()
+
 
 
     # Speech-to-text
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY")
+    stt = SarvamSTTService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        settings=SarvamSTTService.Settings(
+            model="saaras:v3"
+        )
     )
 
     # LLM
@@ -818,25 +1059,48 @@ async def run_bot(webrtc_connection):
     )
 
     llm.register_function(
-    "search_rooms",
-    search_rooms_handler
+        "search_rooms",
+        search_rooms_handler
     )
 
     llm.register_function(
-    "book_room",
-    book_room_handler
+        "book_room",
+        book_room_handler
     )
 
     llm.register_function(
-    "get_bookings",
-    get_bookings_handler
+        "get_bookings",
+        get_bookings_handler
+    )
+
+    llm.register_function(
+        "search_hotel_policy",
+        hotel_policy_handler
+    )
+
+    llm.register_function(
+        "transfer_call",
+        webrtc_transfer_call_handler
+    )
+
+    llm.register_function(
+        "warm_transfer",
+        webrtc_warm_transfer_handler
+    )
+
+    llm.register_function(
+        "hangup_call",
+        webrtc_hangup_call_handler
     )
 
 
     # Text-to-speech
-    tts = DeepgramTTSService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        voice="aura-2-thalia-en"
+    tts = SarvamTTSService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        settings=SarvamTTSService.Settings(
+            model="bulbul:v3-beta",
+            voice="shubh"
+        )
     )
     
 # female-EXAVITQu4vr4xnSDxMaL
@@ -844,53 +1108,96 @@ async def run_bot(webrtc_connection):
     messages = [
         {
             "role": "system",
-            "content": """
-            You are a hotel booking voice assistant.
+            "content": f"""
+            You are a warm, friendly, professional hotel receptionist speaking over a phone call.
 
-            Available tools:
+            Speak naturally like a real human receptionist, not like an AI assistant.
 
-            1. search_rooms(city, room_type)
-            Use for hotel search or availability.
+            Your job:
+            - Help customers find hotels
+            - Book hotel rooms
+            - Retrieve booking details
+            - Answer hotel policy questions
+            - Transfer to a human if needed
 
-            2. book_room(
-            hotel_name,
-            customer_name,
-            check_in_date,
-            nights
-            )
+            Conversation Style & Language Examples:
+            - Keep responses short and natural.
+            - Sound warm, polite, and conversational.
+            - Never sound robotic.
+            - Speak in the SAME language as the user.
+            - Support English, Malayalam, Hindi, Tamil, and mixed-language speech.
+            - If the customer mixes languages, respond naturally in the same mixed style.
+            - Never force English.
+            - If the user asks to speak in another language, switch naturally and continue in that language.
 
-            Use ONLY when the user clearly wants to book.
+            Mixed-Language Examples:
+            User: "Kochi-yil room undo?"
+            Assistant: "Yes, Kochi-il rooms available undu. What type of room are you looking for?"
 
-            Rules:
-            - NEVER book automatically after searching.
-            - After hotel results, wait for user confirmation.
-            - Before booking, collect missing details:
-                - customer name
-                - check-in date
-                - nights
-            - Ask follow-up questions one by one.
-            - Reply briefly and naturally.
-            - If the user says goodbye, bye, or wants to end the call, politely say goodbye and do not call any tools.
+            User: "Munnar me hotel available hai?"
+            Assistant: "Yes, Munnar mein hotels available hain. Aapko standard ya deluxe room chahiye?"
 
+            User: "Can you speak Malayalam?"
+            Assistant: "ശരി, മലയാളത്തിൽ സംസാരിക്കാം. എന്ത് സഹായമാണ് വേണ്ടത്?"
+
+            Greetings & Filler Words:
+            - For greetings or filler words like: "hi", "hello", "okay", "yes", "hmm", "alright" or short acknowledgements, respond naturally and briefly.
             Examples:
+            User: "Hi"
+            Assistant: "Hello! How can I help you?"
+            User: "Okay"
+            Assistant: "Sure 🙂"
+            - Do not treat greetings or filler words as hotel search requests.
+            - Do not say "I didn't catch that" for normal greetings or filler words.
+            - If speech is completely unclear, has low confidence, is ambiguous, or is silent, politely ask: "Sorry, I didn't catch that. Could you repeat please?"
 
-            User: Find hotels in Kochi
-            → search_rooms()
+            Language & City Guessing Rules:
+            - Never infer or guess a city from language, accent, random words, or uncertain pronunciation (e.g. if the user speaks Gujarati, do not guess Ahmedabad).
+            - Only search for hotels after the user clearly mentions a city name.
+            - If uncertain or if the city has not been specified, politely ask: "Sorry, which city are you looking for?"
 
-            User: Premium hotels in Bangalore
-            → search_rooms()
+            Hotel Search Flow & Rules:
+            - Step 1: When the user mentions a city (e.g., "Kochi"), respond naturally saying you will search (e.g., "Kochi-yil hotel check cheyyam. Oru nimisham.") and immediately trigger the 'search_rooms' tool with the city name. Do NOT ask for the room type or other details before searching.
+            - Step 2: Once the tool returns the list of hotels, present them to the user (e.g., "Kochi-yil 3 hotels available undu: Grand Palace, Marina Inn, Sea View Hotel. Ithil etha book cheyyendathu?") and ask which hotel they would like to select.
+            - Step 3: Only after the user selects a hotel, ask for the room type.
+            - Never invent hotel names, room types, prices, or availability. Only use information returned from tools.
+            - If the city name sounds unclear or you are uncertain because of pronunciation, confirm: "Did you mean Kochi?" or "Could you repeat the city name please?"
 
-            User: Book Grand Palace
-            Assistant: What is your name?
+            Booking Rules:
+            - Never book automatically.
+            - First let the customer choose a hotel.
+            - Collect details ONE question at a time in this order:
+              1. Customer name
+              2. Customer phone number (must verify it is exactly a 10-digit number; if they provide an invalid number, ask them to repeat/verify)
+              3. Check-in date
+              4. Number of nights
+            - Never ask multiple questions together.
+            - Never guess missing details.
+            - Before calling 'book_room', confirm details briefly. Example: "Just confirming — Grand Palace in Kochi, for John Doe at 9847573743, check-in on December 5, for 2 nights. Shall I book it?"
+            - Only call 'book_room' after the customer clearly confirms (e.g., "yes", "okay", "correct", "book it").
 
-            User: Mohammed
-            Assistant: What is your check-in date?
+            Hotel Policies:
+            - If the customer asks about: pets, breakfast, wifi, parking, cancellation, check-in/out, pool, gym, pickup, smoking, room service, late checkout, ID proof, or hotel rules, ALWAYS use the 'search_hotel_policy' tool before answering. Never guess.
 
-            User: Tomorrow
-            Assistant: How many nights?
+            Human Transfer:
+            - Call the 'warm_transfer' tool only if the customer explicitly asks for: human, manager, support, real person, transfer call, OR if the customer is frustrated after repeated failures.
+            - Do not transfer for greetings, silence, or language switching.
+            - Politely confirm transfer and call the tool immediately.
 
-            User: 2
-            → book_room()
+            Call Ending:
+            - If the customer says goodbye, bye, or wants to end the call, immediately call the 'hangup_call' tool to disconnect.
+
+            Tool Calling Formatting Rules:
+            - You must call tools natively using the function calling interface.
+            - Never output raw JSON, XML tags, or code snippets (e.g., `<function=...>`, `</function>`, `{{"city": ...}}`) in your conversational text responses.
+            - Do not describe or output the function call to the user. Execute the tool natively and speak only in normal, friendly language.
+
+            Current call_sid:
+            {call_sid}
+
+            Always include this call_sid when calling:
+            - 'warm_transfer'
+            - 'hangup_call'
             """
         }
     ]
@@ -900,81 +1207,157 @@ async def run_bot(webrtc_connection):
         standard_tools=[
             FunctionSchema(
                 name="search_rooms",
-                description="Search available hotel rooms in a city",
-                 properties={
+                description="Search hotel rooms",
+                properties={
                     "city": {
-                        "type": "string",
-                        "description": "Name of the city"
+                        "type": "string"
                     },
                     "room_type": {
-                        "type": "string",
-                        "description": "Type of room like Standard, Deluxe, Premium"
+                        "type": "string"
                     }
                 },
                 required=["city"]
             ),
+
             FunctionSchema(
                 name="book_room",
-                description="Book a hotel room",
+                description="Book hotel room",
                 properties={
                     "hotel_name": {
-                        "type": "string",
-                        "description": "Name of hotel"
+                        "type": "string"
                     },
                     "customer_name": {
+                        "type": "string"
+                    },
+                    "customer_phone": {
                         "type": "string",
-                        "description": "Customer full name"
+                        "description": "The customer's 10-digit phone number (e.g. 9847573743)"
                     },
                     "check_in_date": {
                         "type": "string",
                         "description": "Check-in date in YYYY-MM-DD format"
                     },
                     "nights": {
-                        "type": "integer",
-                        "description": "Number of nights to stay"
+                        "type": "integer"
                     },
                     "city": {
-                        "type": "string",
-                        "description": "City of the hotel"
+                        "type": "string"
                     },
                     "room_type": {
-                        "type": "string",
-                        "description": "Room type (e.g. Standard, Deluxe, Premium)"
+                        "type": "string"
                     }
                 },
                 required=[
                     "hotel_name",
                     "customer_name",
+                    "customer_phone",
                     "check_in_date",
-                    "nights"
+                    "nights",
+                    "city",
+                    "room_type"
                 ]
             ),
+
             FunctionSchema(
                 name="get_bookings",
-                description="Get all hotel bookings of a customer",
+                description="Get customer bookings",
                 properties={
-                    "customer_name": {  
-                        "type": "string",
-                        "description": "Customer full name"
+                    "customer_name": {
+                        "type": "string"
                     }
                 },
                 required=["customer_name"]
+            ),
+
+            FunctionSchema(
+                name="search_hotel_policy",
+                description="""
+                Search hotel policy, FAQs,
+                amenities, cancellation,
+                pet policy, timings,
+                hotel services and rules.
+                """,
+                properties={
+                    "question": {
+                        "type": "string",
+                        "description":
+                        "Hotel-related question"
+                    }
+                },
+                required=["question"]
+            ),
+
+            FunctionSchema(
+                name="transfer_call",
+                description="Transfer the current call to a human support agent",
+                properties={
+                    "call_sid": {
+                        "type": "string",
+                        "description": "Current call SID"
+                    }
+                },
+                required=["call_sid"]
+            ),
+
+            FunctionSchema(
+                name="warm_transfer",
+                description="Transfer customer to support agent using conference call",
+                properties={
+                    "call_sid": {
+                        "type": "string"
+                    }
+                },
+                required=["call_sid"]
+            ),
+
+            FunctionSchema(
+                name="hangup_call",
+                description="End the call when the conversation is finished or user says goodbye",
+                properties={
+                    "call_sid": {
+                        "type": "string"
+                    }
+                },
+                required=["call_sid"]
             )
         ]
     )
 
     context.set_tools(tools)
     context.set_tool_choice("auto")
-    context_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=aic_filter.create_vad_analyzer(
-                speech_hold_duration=0.05,
-                sensitivity=6.0
-            )
+    vad_analyzer = aic_filter.create_vad_analyzer()
+    vad_analyzer._sample_rate = 16000
+    vad_analyzer.set_params(
+        VADParams(
+            confidence=0.5,
+            start_secs=0.0,
+            stop_secs=0.3,
+            min_volume=0.0
         )
     )
 
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=vad_analyzer
+        )
+    )
+
+    @context_aggregator.user().event_handler("on_user_turn_stopped")
+    async def on_user_context(aggregator, strategy, message):
+        save_message(
+            call_sid,
+            "user",
+            message.content
+        )
+
+    @context_aggregator.assistant().event_handler("on_assistant_turn_stopped")
+    async def on_assistant_context(aggregator, message):
+        save_message(
+            call_sid,
+            "assistant",
+            message.content
+        )
 
     pipeline = Pipeline([
         transport.input(),
@@ -985,7 +1368,6 @@ async def run_bot(webrtc_connection):
         transport.output(),
         context_aggregator.assistant()
     ])
-
 
     task = PipelineTask(pipeline)
     runner = PipelineRunner()

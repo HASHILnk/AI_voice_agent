@@ -49,8 +49,50 @@ def book_room(
     nights
 ):
 
+    if room_type:
+        room_type_lower = room_type.lower()
+        if "standard" in room_type_lower:
+            room_type = "Standard"
+        elif "deluxe" in room_type_lower:
+            room_type = "Deluxe"
+        elif "premium" in room_type_lower:
+            room_type = "Premium"
+        else:
+            room_type = room_type.strip().title()
+
     conn = get_connection()
     cursor = conn.cursor()
+
+    # Check if the hotel exists in the database
+    cursor.execute(
+        "SELECT DISTINCT hotel_name, city FROM hotels WHERE LOWER(hotel_name) = LOWER(%s) LIMIT 1;",
+        (hotel_name,)
+    )
+    db_hotel = cursor.fetchone()
+    if not db_hotel:
+        conn.close()
+        return {
+            "status": "failed",
+            "message": f"Hotel '{hotel_name}' not found in system"
+        }
+
+    hotel_name = db_hotel[0]
+    if not city:
+        city = db_hotel[1]
+
+    if room_type:
+        cursor.execute(
+            "SELECT DISTINCT room_type FROM hotels WHERE LOWER(hotel_name) = LOWER(%s) AND LOWER(room_type) = LOWER(%s) LIMIT 1;",
+            (hotel_name, room_type)
+        )
+        db_room_type = cursor.fetchone()
+        if not db_room_type:
+            conn.close()
+            return {
+                "status": "failed",
+                "message": f"Room type '{room_type}' not found for hotel '{hotel_name}'"
+            }
+        room_type = db_room_type[0]
 
     # Check room availability
     availability_query = """
